@@ -12,12 +12,10 @@ from telegram.ext import (
     filters
 )
 
-from supabase import create_client, Client
+from supabase import create_client
 
 
-# --------------------------------------------------
-# ENVIRONMENT VARIABLES (DO NOT HARDCODE)
-# --------------------------------------------------
+# ---------------- CONFIG ----------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
@@ -25,132 +23,95 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 if not BOT_TOKEN or not SUPABASE_URL or not SUPABASE_KEY:
     raise RuntimeError("Missing environment variables")
 
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# --------------------------------------------------
-# SUPABASE CLIENT (v2+ compatible)
-# --------------------------------------------------
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-
-# --------------------------------------------------
-# LOGGING
-# --------------------------------------------------
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 
-# --------------------------------------------------
-# UTIL: Normalize phone number
-# --------------------------------------------------
-def normalize_number(raw: str, default_region="IN"):
+# ---------------- HELPERS ----------------
+def normalize_number(raw, region="IN"):
     try:
         if not raw.startswith("+"):
-            parsed = phonenumbers.parse(raw, default_region)
+            parsed = phonenumbers.parse(raw, region)
         else:
             parsed = phonenumbers.parse(raw)
-
         if not phonenumbers.is_valid_number(parsed):
             return None
-
         return phonenumbers.format_number(parsed, PhoneNumberFormat.E164)
     except Exception:
         return None
 
 
-# --------------------------------------------------
-# DATABASE FUNCTIONS
-# --------------------------------------------------
-def get_owner_from_db(number: str):
-    result = supabase.table("numbers").select("*").eq("number", number).execute()
-    if result.data:
-        return result.data[0]
+def get_owner(number):
+    res = supabase.table("numbers").select("owner").eq("number", number).execute()
+    if res.data:
+        return res.data[0]["owner"]
     return None
 
 
-def save_owner_to_db(number: str, owner: str):
+def save_owner(number, owner):
     supabase.table("numbers").upsert({
         "number": number,
         "owner": owner
     }).execute()
 
 
-# --------------------------------------------------
-# FORMAT RESPONSE
-# --------------------------------------------------
-def build_response(e164: str):
-    parsed = phonenumbers.parse(e164)
-    location = geocoder.description_for_number(parsed, "en") or "Unknown"
-    sim_carrier = carrier.name_for_number(parsed, "en") or "Unknown"
+def build_message(number):
+    parsed = phonenumbers.parse(number)
+    loc = geocoder.description_for_number(parsed, "en") or "Unknown"
+    car = carrier.name_for_number(parsed, "en") or "Unknown"
+    owner = get_owner(number)
 
-    db_entry = get_owner_from_db(e164)
+    msg = (
+        "📞 *Phone Number Info*\n\n"
+        f"• *Number:* `{number}`\n"
+        f"• *Carrier:* {car}\n"
+        f"• *Location:* {loc}\n"
+    )
 
-    msg = "📞 *Phone Number Information*\n\n"
-    msg += f"• *Number:* `{e164}`\n"
-    msg += f"• *Carrier:* {sim_carrier}\n"
-    msg += f"• *Location:* {location}\n"
-
-    if db_entry and db_entry.get("owner"):
-        msg += f"• *Owner Name:* {db_entry['owner']}\n"
+    if owner:
+        msg += f"• *Owner:* {owner}\n"
     else:
-        msg += "• *Owner Name:* Not available\n"
-        msg += f"\n➕ Add name using:\n`/add {e164} Name`\n"
+        msg += "• *Owner:* Not available\n"
+        msg += f"\n➕ Add name:\n`/add {number} Name`\n"
 
     return msg
 
 
-# --------------------------------------------------
-# TELEGRAM HANDLERS
-# --------------------------------------------------
+# ---------------- BOT HANDLERS ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "✅ Bot is running 24/7\n\n"
-        "Send a phone number (with or without country code)."
-    )
+    await update.message.reply_text("✅ Bot is running. Send a phone number.")
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    e164 = normalize_number(text)
-
-    if not e164:
-        await update.message.reply_text("❌ Invalid phone number format.")
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    number = normalize_number(update.message.text)
+    if not number:
+        await update.message.reply_text("❌ Invalid number format.")
         return
-
-    response = build_response(e164)
-    await update.message.reply_markdown(response)
+    await update.message.reply_markdown(build_message(number))
 
 
-async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 2:
         await update.message.reply_text("Usage:\n/add +91XXXXXXXXXX Name")
         return
-
-    number = context.args[0]
-    owner = " ".join(context.args[1:])
-
-    e164 = normalize_number(number)
-    if not e164:
+    number = normalize_number(context.args[0])
+    if not number:
         await update.message.reply_text("❌ Invalid number.")
         return
+    owner = " ".join(context.args[1:])
+    save_owner(number, owner)
+    await update.message.reply_text(f"✅ Saved: {number} → {owner}")
 
-    save_owner_to_db(e164, owner)
-    await update.message.reply_text(f"✅ Saved:\n{e164} → {owner}")
 
-
-# --------------------------------------------------
-# MAIN
-# --------------------------------------------------
+# ---------------- MAIN ----------------
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("add", add_command))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    logger.info("🤖 Bot is running...")
+    app.add_handler(CommandHandler("add", add))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.run_polling()
 
 
 if __name__ == "__main__":
     main()
-
